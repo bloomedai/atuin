@@ -41,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_REPO="plattenschieber/atuin"
+          RELEASE_REPO="bloomedai/atuin"
           RELEASE_TAG="intel-macos-latest"
           UPSTREAM_SHA="$(git rev-parse --short HEAD)"
           UPSTREAM_DATE="$(git show -s --format=%cs HEAD)"
