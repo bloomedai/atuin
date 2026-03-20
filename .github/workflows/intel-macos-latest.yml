@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-and-publish:
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - name: Checkout upstream Atuin
         uses: actions/checkout@v6
@@ -20,6 +20,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+
+      - name: Add Intel macOS target
+        run: rustup target add x86_64-apple-darwin
 
       - name: Build atuin for Intel macOS
         run: cargo build --release --target x86_64-apple-darwin -p atuin
