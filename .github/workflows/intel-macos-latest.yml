@@ -20,6 +20,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
 
       - name: Add Intel macOS target
         run: rustup target add x86_64-apple-darwin
