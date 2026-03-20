@@ -1,0 +1,55 @@
+name: Intel macOS latest binary
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: macos-13
+    steps:
+      - name: Checkout upstream Atuin
+        uses: actions/checkout@v6
+        with:
+          repository: atuinsh/atuin
+          ref: main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Build atuin for Intel macOS
+        run: cargo build --release --target x86_64-apple-darwin -p atuin
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/atuin dist/atuin
+          chmod +x dist/atuin
+          tar -C dist -czf atuin-x86_64-apple-darwin.tar.gz atuin
+          shasum -a 256 atuin-x86_64-apple-darwin.tar.gz > atuin-x86_64-apple-darwin.tar.gz.sha256
+
+      - name: Publish / update release in fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="intel-macos-latest"
+          UPSTREAM_SHA="$(git rev-parse --short HEAD)"
+          UPSTREAM_DATE="$(git show -s --format=%cs HEAD)"
+          NOTES="Automated Intel macOS build from atuinsh/atuin@${UPSTREAM_SHA} (${UPSTREAM_DATE})."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Intel macOS latest" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "Intel macOS latest" \
+              --notes "$NOTES"
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            atuin-x86_64-apple-darwin.tar.gz \
+            atuin-x86_64-apple-darwin.tar.gz.sha256 \
+            --clobber
