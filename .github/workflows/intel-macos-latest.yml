@@ -41,20 +41,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          RELEASE_REPO="plattenschieber/atuin"
           RELEASE_TAG="intel-macos-latest"
           UPSTREAM_SHA="$(git rev-parse --short HEAD)"
           UPSTREAM_DATE="$(git show -s --format=%cs HEAD)"
           NOTES="Automated Intel macOS build from atuinsh/atuin@${UPSTREAM_SHA} (${UPSTREAM_DATE})."
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --title "Intel macOS latest" --notes "$NOTES"
+          if gh release view "$RELEASE_TAG" -R "$RELEASE_REPO" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" -R "$RELEASE_REPO" --title "Intel macOS latest" --notes "$NOTES"
           else
-            gh release create "$RELEASE_TAG" \
+            gh release create "$RELEASE_TAG" -R "$RELEASE_REPO" \
               --title "Intel macOS latest" \
               --notes "$NOTES"
           fi
 
-          gh release upload "$RELEASE_TAG" \
+          gh release upload "$RELEASE_TAG" -R "$RELEASE_REPO" \
             atuin-x86_64-apple-darwin.tar.gz \
             atuin-x86_64-apple-darwin.tar.gz.sha256 \
             --clobber
