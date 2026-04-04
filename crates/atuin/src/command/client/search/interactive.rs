@@ -11,7 +11,7 @@ use eyre::Result;
 use futures_util::FutureExt;
 use semver::Version;
 use time::OffsetDateTime;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     cursor::Cursor,
@@ -52,6 +52,9 @@ use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+
 const TAB_TITLES: [&str; 2] = ["Search", "Inspect"];
 
 pub enum InputAction {
@@ -59,6 +62,7 @@ pub enum InputAction {
     AcceptInspecting,
     Copy(usize),
     Delete(usize),
+    DeleteAllMatching(usize),
     ReturnOriginal,
     ReturnQuery,
     Continue,
@@ -177,18 +181,20 @@ impl State {
     fn handle_input(&mut self, settings: &Settings, input: &Event) -> InputAction {
         match input {
             Event::Key(k) => self.handle_key_input(settings, k),
-            Event::Mouse(m) => self.handle_mouse_input(*m),
+            Event::Mouse(m) => self.handle_mouse_input(*m, settings.invert),
             Event::Paste(d) => self.handle_paste_input(d),
             _ => InputAction::Continue,
         }
     }
 
-    fn handle_mouse_input(&mut self, input: MouseEvent) -> InputAction {
-        match input.kind {
-            event::MouseEventKind::ScrollDown => {
+    fn handle_mouse_input(&mut self, input: MouseEvent, inverted: bool) -> InputAction {
+        match (input.kind, inverted) {
+            (event::MouseEventKind::ScrollDown, false)
+            | (event::MouseEventKind::ScrollUp, true) => {
                 self.scroll_down(1);
             }
-            event::MouseEventKind::ScrollUp => {
+            (event::MouseEventKind::ScrollDown, true)
+            | (event::MouseEventKind::ScrollUp, false) => {
                 self.scroll_up(1);
             }
             _ => {}
@@ -638,6 +644,7 @@ impl State {
             }
             Action::Copy => InputAction::Copy(self.results_state.selected()),
             Action::Delete => InputAction::Delete(self.results_state.selected()),
+            Action::DeleteAll => InputAction::DeleteAllMatching(self.results_state.selected()),
             Action::ReturnOriginal => InputAction::ReturnOriginal,
             Action::ReturnQuery => InputAction::ReturnQuery,
             Action::Exit => Self::handle_key_exit(settings),
@@ -1236,18 +1243,27 @@ impl State {
         let command = if results.is_empty() {
             String::new()
         } else {
-            use itertools::Itertools as _;
             let s = &results[selected].command;
-            s.split('\n')
-                .flat_map(|line| {
-                    line.char_indices()
-                        .step_by(preview_width.into())
-                        .map(|(i, _)| i)
-                        .chain(Some(line.len()))
-                        .tuple_windows()
-                        .map(|(a, b)| (&line[a..b]).escape_control().to_string())
-                })
-                .join("\n")
+            let mut lines = Vec::new();
+            for line in s.split('\n') {
+                let line = line.escape_control();
+                let mut width = 0;
+                let mut start = 0;
+                for (idx, ch) in line.char_indices() {
+                    let w = ch.width().unwrap_or(0); // None for control chars which should not happen
+                    if width + w > preview_width.into() {
+                        lines.push(line[start..idx].to_owned());
+                        start = idx;
+                        width = w;
+                    } else {
+                        width += w;
+                    }
+                }
+                if width != 0 {
+                    lines.push(line[start..].to_owned());
+                }
+            }
+            lines.join("\n")
         };
 
         match compactness {
@@ -1268,6 +1284,62 @@ enum TerminalWriter {
     Stdout(std::io::Stdout),
     #[cfg(unix)]
     Tty(std::fs::File),
+    #[cfg(windows)]
+    ConOut(std::io::LineWriter<std::fs::File>, u32),
+}
+
+impl TerminalWriter {
+    #[cfg(windows)]
+    const CP_UTF8: u32 = 65001;
+
+    fn new() -> std::io::Result<Self> {
+        let stdout = stdout();
+        if stdout.is_terminal() {
+            return Ok(TerminalWriter::Stdout(stdout));
+        }
+
+        // If stdout is not a terminal (e.g., captured by command substitution),
+        // fall back to /dev/tty so the TUI can still render.
+        // This allows usage like: VAR=$(atuin search -i)
+        #[cfg(unix)]
+        {
+            Ok(TerminalWriter::Tty(
+                std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/tty")?,
+            ))
+        }
+
+        // On Windows, use CONOUT$ which is the equivalent of /dev/tty, but this
+        // requires setting the current console output code page to UTF-8 for the
+        // TUI to render properly. We'll set it back to its previous value upon exit.
+        #[cfg(windows)]
+        {
+            let file = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open("CONOUT$")?;
+
+            let initial_console_output_cp = unsafe { GetConsoleOutputCP() };
+            if initial_console_output_cp != Self::CP_UTF8 {
+                unsafe {
+                    SetConsoleOutputCP(Self::CP_UTF8);
+                }
+            }
+
+            Ok(TerminalWriter::ConOut(
+                std::io::LineWriter::new(file),
+                initial_console_output_cp,
+            ))
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Interactive mode requires a terminal",
+        ))
+    }
 }
 
 impl Write for TerminalWriter {
@@ -1276,6 +1348,8 @@ impl Write for TerminalWriter {
             TerminalWriter::Stdout(stdout) => stdout.write(buf),
             #[cfg(unix)]
             TerminalWriter::Tty(file) => file.write(buf),
+            #[cfg(windows)]
+            TerminalWriter::ConOut(writer, _) => writer.write(buf),
         }
     }
 
@@ -1284,6 +1358,21 @@ impl Write for TerminalWriter {
             TerminalWriter::Stdout(stdout) => stdout.flush(),
             #[cfg(unix)]
             TerminalWriter::Tty(file) => file.flush(),
+            #[cfg(windows)]
+            TerminalWriter::ConOut(writer, _) => writer.flush(),
+        }
+    }
+}
+
+impl Drop for TerminalWriter {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let TerminalWriter::ConOut(_, initial_console_output_cp) = self
+            && *initial_console_output_cp != Self::CP_UTF8
+        {
+            unsafe {
+                SetConsoleOutputCP(*initial_console_output_cp);
+            }
         }
     }
 }
@@ -1403,45 +1492,24 @@ fn restore_popup_area(saved: &SavedScreen, popup_rect: Rect, scroll_offset: u16)
 struct Stdout {
     writer: TerminalWriter,
     inline_mode: bool,
+    no_mouse: bool,
 }
 
 impl Stdout {
-    pub fn new(inline_mode: bool, stdout_is_terminal: bool) -> std::io::Result<Self> {
+    pub fn new(inline_mode: bool, no_mouse: bool) -> std::io::Result<Self> {
         terminal::enable_raw_mode()?;
 
-        // If stdout is not a terminal (e.g., captured by command substitution),
-        // fall back to /dev/tty so the TUI can still render.
-        // This allows usage like: VAR=$(atuin search -i)
-        let mut writer = if stdout_is_terminal {
-            TerminalWriter::Stdout(stdout())
-        } else {
-            #[cfg(unix)]
-            {
-                TerminalWriter::Tty(
-                    std::fs::File::options()
-                        .read(true)
-                        .write(true)
-                        .open("/dev/tty")?,
-                )
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Interactive mode requires a terminal",
-                ));
-            }
-        };
+        let mut writer = TerminalWriter::new()?;
 
         if !inline_mode {
             execute!(writer, terminal::EnterAlternateScreen)?;
         }
 
-        execute!(
-            writer,
-            event::EnableMouseCapture,
-            event::EnableBracketedPaste,
-        )?;
+        if !no_mouse {
+            execute!(writer, event::EnableMouseCapture)?;
+        }
+
+        execute!(writer, event::EnableBracketedPaste)?;
 
         #[cfg(not(target_os = "windows"))]
         execute!(
@@ -1456,6 +1524,7 @@ impl Stdout {
         Ok(Self {
             writer,
             inline_mode,
+            no_mouse,
         })
     }
 }
@@ -1468,12 +1537,10 @@ impl Drop for Stdout {
         if !self.inline_mode {
             execute!(self.writer, terminal::LeaveAlternateScreen).unwrap();
         }
-        execute!(
-            self.writer,
-            event::DisableMouseCapture,
-            event::DisableBracketedPaste,
-        )
-        .unwrap();
+        if !self.no_mouse {
+            execute!(self.writer, event::DisableMouseCapture).unwrap();
+        }
+        execute!(self.writer, event::DisableBracketedPaste).unwrap();
 
         terminal::disable_raw_mode().unwrap();
     }
@@ -1497,6 +1564,7 @@ impl Write for Stdout {
 /// of lines the caller should scroll the terminal up before rendering.
 ///
 /// This function performs no I/O — it is a pure computation.
+#[cfg(unix)]
 fn compute_popup_placement(
     cursor_row: u16,
     term_rows: u16,
@@ -1545,15 +1613,13 @@ pub async fn history(
         settings.inline_height
     };
 
-    // Check if stdout is a terminal - if not (e.g., command substitution like VAR=$(atuin search -i)),
-    // we need to use /dev/tty for the TUI and force fullscreen mode (inline mode requires
-    // cursor position queries that don't work when stdout is captured)
-    let stdout_is_terminal = stdout().is_terminal();
-
     // Use fullscreen mode if the inline height doesn't fit in the terminal,
     // this will preserve the scroll position upon exit.
-    // Also force fullscreen when stdout isn't a terminal (inline mode won't work).
-    let inline_height = if !stdout_is_terminal {
+    // Also force fullscreen when stdout isn't a terminal (e.g., command substitution
+    // like VAR=$(atuin search -i)). In that case, we need to use /dev/tty for the TUI and force
+    // fullscreen mode (inline mode won't work as it requires cursor position queries
+    // that don't work when stdout is captured).
+    let inline_height = if !stdout().is_terminal() {
         0
     } else if let Ok(size) = terminal::size()
         && inline_height >= size.1
@@ -1598,12 +1664,12 @@ pub async fn history(
     };
 
     #[cfg(not(unix))]
-    let (saved_screen, popup_rect, popup_scroll_offset): (Option<()>, Rect, u16) =
+    let (saved_screen, popup_rect, _popup_scroll_offset): (Option<()>, Rect, u16) =
         (None, Rect::default(), 0);
 
     let popup_mode = saved_screen.is_some();
 
-    let stdout = Stdout::new(inline_height > 0, stdout_is_terminal)?;
+    let stdout = Stdout::new(inline_height > 0, settings.no_mouse)?;
 
     // In popup mode, clear the popup region on the physical terminal before
     // ratatui takes over. Ratatui's diff-based rendering compares against an
@@ -1772,14 +1838,36 @@ pub async fn history(
 
                                 let entry = results.remove(index);
 
-                                if settings.sync.records {
-                                    let (id, _) = history_store.delete(entry.id).await?;
-                                    history_store.incremental_build(&db, &[id]).await?;
-                                } else {
-                                    db.delete(entry.clone()).await?;
-                                }
+                                let ids = history_store.delete_entries([entry]).await?;
+                                history_store.incremental_build(&db, &ids).await?;
 
                                 app.tab_index  = 0;
+                            },
+                            InputAction::DeleteAllMatching(index) => {
+                                if results.is_empty() {
+                                    break;
+                                }
+
+                                let command = results[index].command.clone();
+
+                                // Remove matching entries from the visible results
+                                results.retain(|e| e.command != command);
+
+                                // Query the DB for ALL entries with this command and delete them
+                                let all_matching = db.query_history(
+                                    &format!(
+                                        "select * from history where command = '{}' and deleted_at is null",
+                                        command.replace('\'', "''")
+                                    )
+                                ).await?;
+
+                                let ids = history_store.delete_entries(all_matching).await?;
+                                history_store.incremental_build(&db, &ids).await?;
+
+                                app.results_len = results.len();
+                                app.results_state = ListState::default();
+                                app.inspecting_state.reset();
+                                app.tab_index = 0;
                             },
                             InputAction::SwitchContext(index) => {
                                 if let Some(index) = index && let Some(entry) = results.get(index) {
@@ -1942,6 +2030,7 @@ pub async fn history(
         InputAction::Continue
         | InputAction::Redraw
         | InputAction::Delete(_)
+        | InputAction::DeleteAllMatching(_)
         | InputAction::SwitchContext(_) => {
             unreachable!("should have been handled!")
         }
